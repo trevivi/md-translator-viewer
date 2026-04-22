@@ -1,0 +1,15 @@
+bin/
+obj/
+app/
+dist/
+*.zip
+# Ephemeral validation captures should never be committed.
+artifacts-*.png
+artifacts-*.jpg
+artifacts-*.jpeg
+artifacts-*.webp
+artifacts-*.bmp
+.vs/
+AGENTS.md
+docs/agent-handoff.md
+.local-workflow/
