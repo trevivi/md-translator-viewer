@@ -106,16 +106,16 @@ Assert-PathWithin -BasePath $distRoot -TargetPath $publishDirectory
 Assert-PathWithin -BasePath $distRoot -TargetPath $zipPath
 Assert-PathWithin -BasePath $distRoot -TargetPath $checksumPath
 
-if (Test-Path -LiteralPath $publishDirectory) {
-    Remove-Item -LiteralPath $publishDirectory -Recurse -Force
-}
+Get-ChildItem -LiteralPath $distRoot -Force | ForEach-Object {
+    $candidatePath = $_.FullName
+    Assert-PathWithin -BasePath $distRoot -TargetPath $candidatePath
 
-if (Test-Path -LiteralPath $zipPath) {
-    Remove-Item -LiteralPath $zipPath -Force
-}
-
-if (Test-Path -LiteralPath $checksumPath) {
-    Remove-Item -LiteralPath $checksumPath -Force
+    if ($_.PSIsContainer) {
+        Remove-Item -LiteralPath $candidatePath -Recurse -Force
+    }
+    else {
+        Remove-Item -LiteralPath $candidatePath -Force
+    }
 }
 
 Invoke-ExternalCommand `
