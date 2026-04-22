@@ -4,6 +4,9 @@ param(
     [string]$Configuration = "Release",
     [string]$RuntimeIdentifier = "win-x64",
     [string]$Project = "MdTranslatorViewer.csproj",
+    [ValidateSet("framework-dependent", "self-contained")]
+    [string]$DeploymentMode = "framework-dependent",
+    [string]$SatelliteResourceLanguages = "en-US",
     [string]$Version,
     [switch]$SkipBuild
 )
@@ -73,6 +76,28 @@ function Get-ReleaseVersionSuffix {
     return $trimmedVersion
 }
 
+function Get-DeploymentSettings {
+    param([string]$Mode)
+
+    switch ($Mode) {
+        "framework-dependent" {
+            return [pscustomobject]@{
+                AssetSuffix = "framework-dependent"
+                SelfContained = "false"
+            }
+        }
+        "self-contained" {
+            return [pscustomobject]@{
+                AssetSuffix = "self-contained"
+                SelfContained = "true"
+            }
+        }
+        default {
+            throw "Unsupported deployment mode: $Mode"
+        }
+    }
+}
+
 $resolvedRoot = Resolve-RepositoryRoot -RequestedRoot $RepoRoot
 $projectPath = if ([System.IO.Path]::IsPathRooted($Project)) {
     $Project
@@ -87,9 +112,10 @@ if (-not (Test-Path -LiteralPath $projectPath)) {
 
 $appName = [System.IO.Path]::GetFileNameWithoutExtension($projectPath)
 $releaseVersion = Get-ReleaseVersionSuffix -RequestedVersion $Version
-$releaseAssetName = "$appName-$releaseVersion-$RuntimeIdentifier-portable"
+$deployment = Get-DeploymentSettings -Mode $DeploymentMode
+$releaseAssetName = "$appName-$releaseVersion-$RuntimeIdentifier-$($deployment.AssetSuffix)"
 $distRoot = Join-Path $resolvedRoot "dist"
-$publishDirectory = Join-Path $distRoot "$appName-$RuntimeIdentifier"
+$publishDirectory = Join-Path $distRoot "$appName-$RuntimeIdentifier-$($deployment.AssetSuffix)"
 $zipPath = Join-Path $distRoot "$releaseAssetName.zip"
 $checksumPath = Join-Path $distRoot "$releaseAssetName.zip.sha256.txt"
 
@@ -118,21 +144,27 @@ Get-ChildItem -LiteralPath $distRoot -Force | ForEach-Object {
     }
 }
 
+$publishArguments = @(
+    "publish",
+    $projectPath,
+    "-c",
+    $Configuration,
+    "-r",
+    $RuntimeIdentifier,
+    "-p:PublishSingleFile=false",
+    "--self-contained",
+    $deployment.SelfContained,
+    "-o",
+    $publishDirectory
+)
+
+if (-not [string]::IsNullOrWhiteSpace($SatelliteResourceLanguages)) {
+    $publishArguments += "-p:SatelliteResourceLanguages=$SatelliteResourceLanguages"
+}
+
 Invoke-ExternalCommand `
     -FilePath "dotnet" `
-    -ArgumentList @(
-        "publish",
-        $projectPath,
-        "-c",
-        $Configuration,
-        "-r",
-        $RuntimeIdentifier,
-        "-p:PublishSingleFile=true",
-        "--self-contained",
-        "true",
-        "-o",
-        $publishDirectory
-    ) `
+    -ArgumentList $publishArguments `
     -WorkingDirectory $resolvedRoot
 
 Get-ChildItem -Path $publishDirectory -File | Where-Object {
@@ -148,10 +180,12 @@ $sha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
 Write-Host "Created release zip: $($zipItem.FullName)"
 Write-Host "Created checksum file: $checksumPath"
 Write-Host "Publish folder: $publishDirectory"
+Write-Host "Deployment mode: $DeploymentMode"
 Write-Host "SHA256: $sha256"
 
 [pscustomobject]@{
     ChecksumPath = $checksumPath
+    DeploymentMode = $DeploymentMode
     PublishDirectory = $publishDirectory
     ZipPath = $zipItem.FullName
     ZipSizeBytes = $zipItem.Length

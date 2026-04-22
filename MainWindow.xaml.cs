@@ -7,7 +7,6 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Security.Principal;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -100,9 +99,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly MarkdownPipeline _markdownPipeline;
     private readonly ObservableCollection<DocumentTab> _openDocuments = [];
     private readonly List<DocumentTab> _documentSelectionHistory = [];
+    private readonly Dictionary<DocumentTab, FileSystemWatcher> _fileWatchers = [];
+    private readonly HashSet<DocumentTab> _documentsPendingReload = [];
     private readonly string _webViewMessageToken = Guid.NewGuid().ToString("N");
 
-    private FileSystemWatcher? _fileWatcher;
     private Task<CoreWebView2Environment>? _webViewEnvironmentTask;
     private bool _documentWebViewReady;
     private bool _documentShellLoaded;
@@ -115,7 +115,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _updatingTabLayout;
     private bool _updatingTabScrollIndicator;
     private bool _titleBarDragPending;
-    private bool _warnedAboutElevatedDragDrop;
     private Point _tabDragStartPoint;
     private DocumentTab? _tabDragCandidate;
     private double _tabWidth = MaximumTabWidth - TabItemChromeWidth;
@@ -258,7 +257,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         ComponentDispatcher.ThreadPreprocessMessage -= ComponentDispatcher_OnThreadPreprocessMessage;
         _reloadTimer.Stop();
-        _fileWatcher?.Dispose();
+        DisposeAllWatchers();
         SaveAppState();
 
         foreach (var document in _openDocuments)
@@ -304,12 +303,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             if (restoredTabs)
             {
-                WarnIfDragDropBlockedByElevation();
                 return;
             }
 
             await RenderSelectedDocumentAsync();
-            WarnIfDragDropBlockedByElevation();
         }
         catch (Exception ex)
         {
@@ -374,6 +371,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         document = new DocumentTab(fullPath);
         _openDocuments.Add(document);
+        ConfigureWatcher(document);
 
         if (updateTabsState)
         {
@@ -444,7 +442,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             SetLoading(true, "Opening document...");
             StatusText.Text = "Loading document...";
-            ConfigureWatcher(document.FilePath);
+            ConfigureWatcher(document);
         }
 
         try
@@ -453,8 +451,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var markdown = await ReadMarkdownFileAsync(document.FilePath, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             var fileContentVersion = TryGetFileContentVersion(document.FilePath);
+            var wasMissing = document.IsMissing;
 
             document.MarkLoaded(markdown, fileContentVersion);
+            if (wasMissing)
+            {
+                RefreshTabOverflowMenu();
+            }
+
             var cachedTranslation = await _translationService.TryGetCachedTranslationAsync(
                 markdown,
                 TranslationLanguage,
@@ -633,7 +637,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         if (SelectedDocument.Markdown is null)
         {
-            DocumentWebView.NavigateToString(_htmlRenderer.RenderEmpty("Opening document...", _webViewMessageToken, CurrentTheme.DocumentTheme));
+            var emptyMessage = SelectedDocument.IsMissing
+                ? "The document is unavailable. Waiting for it to return."
+                : "Opening document...";
+            DocumentWebView.NavigateToString(_htmlRenderer.RenderEmpty(emptyMessage, _webViewMessageToken, CurrentTheme.DocumentTheme));
             _documentShellLoaded = false;
             return;
         }
@@ -723,7 +730,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         FilePathText.Text = "Open a Markdown file to start.";
         StatusText.Text = "Ready";
         Title = "MD Translator Viewer";
-        ConfigureWatcher(null);
     }
 
     private void UpdateWindowStateForSelectedDocument()
@@ -737,29 +743,77 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         FilePathText.Text = SelectedDocument.FilePath;
         StatusText.Text = SelectedDocument.StatusMessage;
         Title = $"MD Translator Viewer - {SelectedDocument.DisplayName}";
-        ConfigureWatcher(SelectedDocument.FilePath);
     }
 
-    private void ConfigureWatcher(string? filePath)
+    private void ConfigureWatcher(DocumentTab document)
     {
-        _fileWatcher?.Dispose();
-        _fileWatcher = null;
+        DisposeWatcher(document);
 
-        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+        if (!TryResolveWatchScope(document.FilePath, out var directoryPath, out var fileName))
         {
             return;
         }
 
-        _fileWatcher = new FileSystemWatcher(Path.GetDirectoryName(filePath)!, Path.GetFileName(filePath))
+        var watcher = new FileSystemWatcher(directoryPath, fileName)
         {
-            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName | NotifyFilters.CreationTime,
             EnableRaisingEvents = true,
         };
 
-        _fileWatcher.Changed += FileWatcher_OnChanged;
-        _fileWatcher.Created += FileWatcher_OnChanged;
-        _fileWatcher.Deleted += FileWatcher_OnDeleted;
-        _fileWatcher.Renamed += FileWatcher_OnRenamed;
+        watcher.Changed += FileWatcher_OnChanged;
+        watcher.Created += FileWatcher_OnChanged;
+        watcher.Deleted += FileWatcher_OnDeleted;
+        watcher.Renamed += FileWatcher_OnRenamed;
+        _fileWatchers[document] = watcher;
+    }
+
+    private void DisposeWatcher(DocumentTab document)
+    {
+        if (!_fileWatchers.Remove(document, out var watcher))
+        {
+            return;
+        }
+
+        _documentsPendingReload.Remove(document);
+        watcher.Dispose();
+    }
+
+    private void DisposeAllWatchers()
+    {
+        foreach (var watcher in _fileWatchers.Values)
+        {
+            watcher.Dispose();
+        }
+
+        _fileWatchers.Clear();
+        _documentsPendingReload.Clear();
+    }
+
+    private static bool TryResolveWatchScope(string filePath, out string directoryPath, out string fileName)
+    {
+        directoryPath = string.Empty;
+        fileName = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(filePath);
+            directoryPath = Path.GetDirectoryName(fullPath) ?? string.Empty;
+            fileName = Path.GetFileName(fullPath);
+            return !string.IsNullOrWhiteSpace(directoryPath) &&
+                   !string.IsNullOrWhiteSpace(fileName) &&
+                   Directory.Exists(directoryPath);
+        }
+        catch
+        {
+            directoryPath = string.Empty;
+            fileName = string.Empty;
+            return false;
+        }
     }
 
     private void UpdateTabsState()
@@ -1009,7 +1063,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             var item = new MenuItem
             {
-                Header = document.DisplayName,
+                Header = document.IsMissing ? $"{document.DisplayName} (missing)" : document.DisplayName,
                 IsCheckable = true,
                 IsChecked = ReferenceEquals(document, SelectedDocument),
                 Tag = document,
@@ -1022,18 +1076,35 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void FileWatcher_OnChanged(object sender, FileSystemEventArgs e)
     {
-        if (AutoReloadCheckBox.IsChecked != true ||
-            SelectedDocument is null ||
-            !string.Equals(SelectedDocument.FilePath, e.FullPath, StringComparison.OrdinalIgnoreCase))
+        _ = Dispatcher.InvokeAsync(() =>
         {
-            return;
-        }
+            var document = TryFindOpenDocument(e.FullPath);
+            if (document is null)
+            {
+                return;
+            }
 
-        Dispatcher.Invoke(() =>
-        {
-            _reloadTimer.Stop();
-            _reloadTimer.Start();
-            StatusText.Text = "Change detected...";
+            var shouldReload = document.IsMissing ||
+                               e.ChangeType == WatcherChangeTypes.Created ||
+                               AutoReloadCheckBox.IsChecked == true;
+
+            if (!shouldReload)
+            {
+                if (ReferenceEquals(SelectedDocument, document))
+                {
+                    StatusText.Text = "Change detected";
+                }
+
+                return;
+            }
+
+            QueueDocumentReload(
+                document,
+                document.IsMissing
+                    ? "File restored. Reloading..."
+                    : e.ChangeType == WatcherChangeTypes.Created
+                        ? "File updated. Reloading..."
+                        : "Change detected. Reloading...");
         });
     }
 
@@ -1061,13 +1132,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 switch (renameOutcome)
                 {
                     case FileRenameOutcome.ReplacedInPlace:
-                        if (ReferenceEquals(SelectedDocument, document))
-                        {
-                            QueueSelectedDocumentReload("File replaced. Reloading...");
-                        }
+                        QueueDocumentReload(document, "File replaced. Reloading...");
                         break;
                     case FileRenameOutcome.Renamed:
                         document.UpdatePath(e.FullPath);
+                        ConfigureWatcher(document);
+                        RefreshTabOverflowMenu();
                         if (ReferenceEquals(SelectedDocument, document))
                         {
                             UpdateWindowStateForSelectedDocument();
@@ -1075,14 +1145,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
                         PersistSessionState();
 
-                        if (ReferenceEquals(SelectedDocument, document) &&
-                            AutoReloadCheckBox.IsChecked == true)
+                        if (AutoReloadCheckBox.IsChecked == true)
                         {
-                            QueueSelectedDocumentReload("File renamed. Reloading...");
+                            QueueDocumentReload(document, "File renamed. Reloading...");
                         }
-                        else if (ReferenceEquals(SelectedDocument, document))
+                        else
                         {
-                            StatusText.Text = "File renamed";
+                            document.SetStatus("File renamed");
+                            RefreshTabOverflowMenu();
+
+                            if (ReferenceEquals(SelectedDocument, document))
+                            {
+                                StatusText.Text = "File renamed";
+                            }
                         }
                         break;
                     default:
@@ -1099,12 +1174,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void FileWatcher_OnDeleted(object sender, FileSystemEventArgs e)
     {
-        Dispatcher.InvokeAsync(async () =>
+        _ = Dispatcher.InvokeAsync(async () =>
         {
             try
             {
-                var document = _openDocuments.FirstOrDefault(item =>
-                    string.Equals(item.FilePath, e.FullPath, StringComparison.OrdinalIgnoreCase));
+                var document = TryFindOpenDocument(e.FullPath);
 
                 if (document is null ||
                     !await IsDocumentStillMissingAsync(document.FilePath))
@@ -1124,9 +1198,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private async void ReloadTimer_OnTick(object? sender, EventArgs e)
     {
         _reloadTimer.Stop();
-        if (SelectedDocument is not null)
+        var documentsToReload = _documentsPendingReload.ToArray();
+        _documentsPendingReload.Clear();
+
+        foreach (var document in documentsToReload)
         {
-            await LoadDocumentIntoTabAsync(SelectedDocument, preserveScroll: true);
+            if (!_openDocuments.Contains(document))
+            {
+                continue;
+            }
+
+            await LoadDocumentIntoTabAsync(
+                document,
+                preserveScroll: ReferenceEquals(SelectedDocument, document));
         }
     }
 
@@ -1388,11 +1472,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             WindowPlacement = CaptureWindowPlacement(),
             OpenDocumentPaths = _openDocuments
                 .Select(document => document.FilePath)
-                .Where(File.Exists)
                 .ToArray(),
-            SelectedDocumentPath = SelectedDocument is not null && File.Exists(SelectedDocument.FilePath)
-                ? SelectedDocument.FilePath
-                : null,
+            SelectedDocumentPath = SelectedDocument?.FilePath,
         });
     }
 
@@ -1592,23 +1673,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         DropOverlay.Visibility = Visibility.Collapsed;
     }
 
-    private void WarnIfDragDropBlockedByElevation()
-    {
-        if (_warnedAboutElevatedDragDrop || !IsRunningElevated())
-        {
-            return;
-        }
-
-        _warnedAboutElevatedDragDrop = true;
-        StatusText.Text = "Running as administrator disables drag and drop from normal Explorer";
-        MessageBox.Show(
-            this,
-            "This session is running as administrator.\n\nWindows blocks dragging files from a normal File Explorer window into elevated apps. Launch MD Translator Viewer normally to use drag and drop.",
-            "MD Translator Viewer",
-            MessageBoxButton.OK,
-            MessageBoxImage.Information);
-    }
-
     private static bool HasSupportedMarkdownDrop(IDataObject dataObject)
     {
         return TryGetDroppedPaths(dataObject, out var droppedPaths) &&
@@ -1720,13 +1784,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         droppedPaths = paths;
         return true;
-    }
-
-    private static bool IsRunningElevated()
-    {
-        using var identity = WindowsIdentity.GetCurrent();
-        var principal = new WindowsPrincipal(identity);
-        return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
     private void WebView_OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
@@ -2631,6 +2688,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         foreach (var document in _openDocuments)
         {
+            DisposeWatcher(document);
             document.Dispose();
         }
 
@@ -2739,6 +2797,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         var wasSelected = ReferenceEquals(SelectedDocument, document);
         RemoveDocumentFromSelectionHistory(document);
+        DisposeWatcher(document);
         document.Dispose();
         _openDocuments.Remove(document);
         UpdateTabsState();
@@ -3373,37 +3432,46 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async Task HandleMissingDocumentAsync(DocumentTab document)
     {
-        var documentPath = document.FilePath;
-
-        if (_openDocuments.Contains(document))
-        {
-            await CloseDocumentTabAsync(document);
-        }
-        else if (ReferenceEquals(SelectedDocument, document))
-        {
-            SelectedDocument = null;
-            await RenderSelectedDocumentAsync();
-            PersistSessionState();
-        }
-
-        MessageBox.Show(
-            this,
-            $"The document is no longer available and was removed from the viewer.\n\n{documentPath}",
-            "MD Translator Viewer",
-            MessageBoxButton.OK,
-            MessageBoxImage.Warning);
-    }
-
-    private void QueueSelectedDocumentReload(string statusText)
-    {
-        if (SelectedDocument is null || AutoReloadCheckBox.IsChecked != true)
+        if (!_openDocuments.Contains(document))
         {
             return;
         }
 
+        document.MarkMissing();
+        RefreshTabOverflowMenu();
+
+        if (ReferenceEquals(SelectedDocument, document))
+        {
+            SetLoading(false);
+            UpdateWindowStateForSelectedDocument();
+            await RenderSelectedDocumentAsync(preserveScroll: true);
+        }
+
+        PersistSessionState();
+    }
+
+    private void QueueDocumentReload(DocumentTab document, string statusText)
+    {
+        if (!_openDocuments.Contains(document))
+        {
+            return;
+        }
+
+        _documentsPendingReload.Add(document);
         _reloadTimer.Stop();
         _reloadTimer.Start();
-        StatusText.Text = statusText;
+        document.SetStatus(statusText);
+
+        if (ReferenceEquals(SelectedDocument, document))
+        {
+            StatusText.Text = statusText;
+        }
+    }
+
+    private DocumentTab? TryFindOpenDocument(string fullPath)
+    {
+        return _openDocuments.FirstOrDefault(document =>
+            string.Equals(document.FilePath, fullPath, StringComparison.OrdinalIgnoreCase));
     }
 
     private async void MainWindow_OnActivated(object? sender, EventArgs e)
@@ -3675,6 +3743,7 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
     private string? _markdown;
     private string? _translatedMarkdown;
     private string _statusMessage = "Ready";
+    private bool _isMissing;
     private bool _translationFailed;
     private bool _translationInProgress;
 
@@ -3755,6 +3824,21 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
         }
     }
 
+    public bool IsMissing
+    {
+        get => _isMissing;
+        private set
+        {
+            if (_isMissing == value)
+            {
+                return;
+            }
+
+            _isMissing = value;
+            OnPropertyChanged();
+        }
+    }
+
     public bool TranslationFailed
     {
         get => _translationFailed;
@@ -3806,7 +3890,7 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
 
         _translationInProgress = true;
         TranslationFailed = false;
-        if (updateStatus)
+        if (updateStatus && !IsMissing)
         {
             StatusMessage = $"Loaded {DisplayName}. Translating...";
         }
@@ -3823,6 +3907,7 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
     {
         Markdown = markdown;
         _loadedFileContentVersion = fileContentVersion;
+        IsMissing = false;
         TranslationFailed = false;
         TranslatedMarkdown = null;
         _translationInProgress = false;
@@ -3830,6 +3915,11 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
 
     internal bool HasChangedOnDisk(FileContentVersion? currentFileContentVersion)
     {
+        if (IsMissing)
+        {
+            return currentFileContentVersion is not null;
+        }
+
         if (Markdown is null)
         {
             return true;
@@ -3844,7 +3934,7 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
         TranslationFailed = false;
         _translationInProgress = false;
 
-        if (updateStatus)
+        if (updateStatus && !IsMissing)
         {
             StatusMessage = $"Loaded {DisplayName} (translated)";
         }
@@ -3855,7 +3945,7 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
         TranslationFailed = true;
         _translationInProgress = false;
 
-        if (updateStatus)
+        if (updateStatus && !IsMissing)
         {
             StatusMessage = "Translation failed";
         }
@@ -3872,6 +3962,15 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
         _translationInProgress = false;
     }
 
+    public void MarkMissing()
+    {
+        CancelPendingLoad();
+        _loadedFileContentVersion = null;
+        _translationInProgress = false;
+        IsMissing = true;
+        StatusMessage = "File unavailable. Waiting for it to return...";
+    }
+
     public void SetStatus(string statusMessage)
     {
         StatusMessage = statusMessage;
@@ -3883,6 +3982,7 @@ public sealed class DocumentTab(string filePath) : INotifyPropertyChanged, IDisp
         FilePath = fullPath;
         DisplayName = Path.GetFileName(fullPath);
         _loadedFileContentVersion = null;
+        IsMissing = false;
     }
 
     internal IReadOnlyList<CodeBlockTranslationPayload> GetCodeBlockTranslationPayloads()

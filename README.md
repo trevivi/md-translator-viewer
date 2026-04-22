@@ -24,10 +24,11 @@ Without a file argument, launch it and use `Open File`.
 ## Publish
 
 ```powershell
-dotnet publish .\MdTranslatorViewer.csproj -c Release -o .\app
+dotnet publish .\MdTranslatorViewer.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=false -o .\app
 ```
 
 The synced executable will be under `.\app\`
+using the same slim multi-file layout as the default release ZIP.
 
 Create a release ZIP for distribution:
 
@@ -37,10 +38,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\create-release-zip.ps1 -Versi
 
 Replace `v0.1.0` with the tag you are publishing.
 
+This default release is framework-dependent to keep the ZIP smaller and the folder layout cleaner.
+It requires the .NET 9 Desktop Runtime on the target machine.
+
+If you need a runtime-included package instead, build the larger self-contained variant explicitly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\create-release-zip.ps1 -Version v0.1.0 -DeploymentMode self-contained
+```
+
 The packaged output will be under `.\dist\`
 along with a `.sha256.txt` checksum file that can be uploaded to GitHub Releases.
 
-Published outputs are portable by default.
+Published outputs ship as multi-file folders instead of a single bundled EXE.
 Their tabs, settings, translation cache, diagnostics log, and WebView2 session data are stored under `.\data\` beside the executable when the app is launched from a writable folder.
 
 ## GitHub Release
@@ -49,8 +59,8 @@ Their tabs, settings, translation cache, diagnostics log, and WebView2 session d
 2. Create a new release from the GitHub Releases page.
 3. Create a version tag such as `v0.1.0`.
 4. Run `powershell -ExecutionPolicy Bypass -File .\scripts\create-release-zip.ps1 -Version v0.1.0`
-5. Upload `.\dist\MdTranslatorViewer-v0.1.0-win-x64-portable.zip`
-6. Upload `.\dist\MdTranslatorViewer-v0.1.0-win-x64-portable.zip.sha256.txt`
+5. Upload `.\dist\MdTranslatorViewer-v0.1.0-win-x64-framework-dependent.zip`
+6. Upload `.\dist\MdTranslatorViewer-v0.1.0-win-x64-framework-dependent.zip.sha256.txt`
 
 For portable behavior, tell users to extract the ZIP to a normal writable folder such as `Downloads` or `Documents`, not `Program Files`.
 

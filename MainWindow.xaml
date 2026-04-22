@@ -48,6 +48,7 @@
         <SolidColorBrush x:Key="TabBorderBrush" Color="#2B2B2B" />
         <SolidColorBrush x:Key="TabInactiveForegroundBrush" Color="#9D9D9D" />
         <SolidColorBrush x:Key="TabActiveForegroundBrush" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="TabMissingForegroundBrush" Color="#FF6B6B" />
         <SolidColorBrush x:Key="TabAccentBrush" Color="#0078D4" />
         <SolidColorBrush x:Key="ControlHoverBrush" Color="#2B2B2B" />
         <SolidColorBrush x:Key="ToggleTrackBrush" Color="#313131" />
@@ -882,10 +883,24 @@
                                                        Margin="0,2,4,0"
                                                        VerticalAlignment="Center"
                                                        FontSize="13"
-                                                       Foreground="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=Foreground}"
                                                        Text="{Binding DisplayName}"
                                                        TextTrimming="CharacterEllipsis"
-                                                       TextWrapping="NoWrap" />
+                                                       TextWrapping="NoWrap">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Foreground"
+                                                                Value="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=Foreground}" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsMissing}" Value="True">
+                                                                <Setter Property="Foreground"
+                                                                        Value="{DynamicResource TabMissingForegroundBrush}" />
+                                                                <Setter Property="TextDecorations"
+                                                                        Value="Strikethrough" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
                                             <Button Grid.Column="1"
                                                     Style="{StaticResource TabCloseButtonStyle}"
                                                     Content="x"
